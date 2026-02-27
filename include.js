@@ -1,9 +1,8 @@
 // ==UserScript==
-// @name         Zendesk Weekly Report
+// @name         Zendesk Weekly Report Popup
 // @namespace    http://tampermonkey.net/
-// @version      0.1.0
+// @version      1.0.0
 // @description  Run weekly Zendesk ticket reports (assigned, solved, and takeovers) from a popup.
-// @author       Ty Wark
 // @match        https://retail-support.zendesk.com/agent/*
 // @grant        none
 // ==/UserScript==
@@ -11,10 +10,11 @@
 (function () {
   "use strict";
 
-  const DEFAULT_ASSIGNEE_INPUT = "";
   const ASSIGNEE_FALLBACK_KEYWORD = "me";
-  const DEFAULT_WEEK_STARTS_ON = 1; // 1 = Monday, 0 = Sunday
-  const DEFAULT_MAX_TICKETS_TO_AUDIT = 200;
+  const FIXED_WEEK_STARTS_ON = 0; // Sunday
+  const TAKEOVER_BATCH_SIZE = 100;
+  const TAKEOVER_BATCH_SLEEP_MS = 30_000;
+  const LAUNCHER_POSITION_STORAGE_KEY = "zd-weekly-report-launcher-position";
 
   const BASE = "https://retail-support.zendesk.com";
   const FLATPICKR_JS_URL = "https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js";
@@ -38,7 +38,7 @@
 #zd-weekly-report-launcher {
   position: fixed;
   right: 16px;
-  bottom: 16px;
+  top: 16px;
   z-index: 999999;
   background: linear-gradient(135deg, var(--zd-accent), var(--zd-accent-2));
   color: #fff;
@@ -50,10 +50,16 @@
   font-weight: 600;
   letter-spacing: 0.2px;
   box-shadow: var(--zd-shadow);
+  cursor: grab;
+  user-select: none;
 }
 #zd-weekly-report-launcher:hover {
   transform: translateY(-1px);
   transition: transform 120ms ease, box-shadow 120ms ease;
+}
+#zd-weekly-report-launcher.dragging {
+  cursor: grabbing;
+  transform: none;
 }
 
 #zd-weekly-report-overlay {
@@ -110,7 +116,7 @@
 
 #zd-weekly-report-controls {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   padding: 14px 16px;
   border-bottom: 1px solid var(--zd-border);
@@ -327,7 +333,7 @@
 
 @media (max-width: 980px) {
   #zd-weekly-report-controls {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: 1fr;
   }
 }
 @media (max-width: 620px) {
@@ -401,7 +407,7 @@
 
   const modal = document.createElement("div");
   modal.id = "zd-weekly-report-modal";
-  const initialWeekDate = getWeekStartDate(new Date(), DEFAULT_WEEK_STARTS_ON);
+  const initialWeekDate = getWeekStartDate(new Date(), FIXED_WEEK_STARTS_ON);
   const todayIso = initialWeekDate.toISOString().slice(0, 10);
 
   modal.innerHTML = `
@@ -414,23 +420,8 @@
     </div>
     <div id="zd-weekly-report-controls">
       <label>
-        Assignee (optional)
-        <input id="zd-assignee" type="text" value="${DEFAULT_ASSIGNEE_INPUT}" placeholder="me (blank), user id, email, or name">
-      </label>
-      <label>
-        Week starts on
-        <select id="zd-week-start">
-          <option value="1" selected>Monday</option>
-          <option value="0">Sunday</option>
-        </select>
-      </label>
-      <label>
-        Week containing date
+        Week containing date (Sunday start)
         <input id="zd-week-date" type="text" value="${todayIso}" placeholder="YYYY-MM-DD" autocomplete="off">
-      </label>
-      <label>
-        Max audits tickets
-        <input id="zd-max-audits" type="number" min="1" value="${DEFAULT_MAX_TICKETS_TO_AUDIT}">
       </label>
       <div class="actions">
         <button id="zd-run-reports" type="button">Run reports</button>
@@ -451,10 +442,7 @@
   const copyReportButton = modal.querySelector("#zd-copy-report");
   const copyButton = modal.querySelector("#zd-copy-output");
 
-  const assigneeInput = modal.querySelector("#zd-assignee");
-  const weekStartSelect = modal.querySelector("#zd-week-start");
   const weekDateInput = modal.querySelector("#zd-week-date");
-  const maxAuditsInput = modal.querySelector("#zd-max-audits");
   const statusEl = modal.querySelector("#zd-weekly-report-status");
   const outputEl = modal.querySelector("#zd-weekly-report-output");
 
@@ -462,6 +450,62 @@
   let latestReportOutput = "";
   let flatpickrInstance = null;
   let isSnappingDate = false;
+  let suppressLauncherClick = false;
+  let assigneeOverrideKeyword = null;
+
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+
+  const applyLauncherPosition = ({ left, top } = {}) => {
+    if (typeof left === "number") {
+      launcher.style.left = `${left}px`;
+      launcher.style.right = "auto";
+    }
+    if (typeof top === "number") {
+      launcher.style.top = `${top}px`;
+      launcher.style.bottom = "auto";
+    }
+  };
+
+  const loadLauncherPosition = () => {
+    try {
+      const raw = localStorage.getItem(LAUNCHER_POSITION_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      const left = Number(parsed?.left);
+      const top = Number(parsed?.top);
+      if (Number.isFinite(left) && Number.isFinite(top)) {
+        applyLauncherPosition({ left, top });
+      }
+    } catch {
+      // ignore malformed persisted launcher state
+    }
+  };
+
+  const saveLauncherPosition = ({ left, top }) => {
+    try {
+      localStorage.setItem(LAUNCHER_POSITION_STORAGE_KEY, JSON.stringify({ left, top }));
+    } catch {
+      // ignore storage failures
+    }
+  };
+
+  const clampLauncherToViewport = ({ persist = false } = {}) => {
+    const rect = launcher.getBoundingClientRect();
+    const maxLeft = Math.max(8, window.innerWidth - rect.width - 8);
+    const maxTop = Math.max(8, window.innerHeight - rect.height - 8);
+    const left = clamp(rect.left, 8, maxLeft);
+    const top = clamp(rect.top, 8, maxTop);
+    const moved = Math.abs(left - rect.left) > 0.5 || Math.abs(top - rect.top) > 0.5;
+
+    if (!moved) {
+      return;
+    }
+
+    applyLauncherPosition({ left, top });
+    if (persist) {
+      saveLauncherPosition({ left, top });
+    }
+  };
 
   const showModal = () => {
     overlay.style.display = "block";
@@ -473,7 +517,73 @@
     modal.style.display = "none";
   };
 
-  launcher.addEventListener("click", showModal);
+  launcher.addEventListener("click", () => {
+    if (suppressLauncherClick) {
+      suppressLauncherClick = false;
+      return;
+    }
+    showModal();
+  });
+
+  launcher.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const rect = launcher.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let moved = false;
+
+    launcher.classList.add("dragging");
+    launcher.setPointerCapture(event.pointerId);
+
+    const onPointerMove = (moveEvent) => {
+      const dx = Math.abs(moveEvent.clientX - startX);
+      const dy = Math.abs(moveEvent.clientY - startY);
+      if (!moved && (dx > 4 || dy > 4)) {
+        moved = true;
+      }
+      if (!moved) {
+        return;
+      }
+
+      const maxLeft = Math.max(0, window.innerWidth - rect.width - 8);
+      const maxTop = Math.max(0, window.innerHeight - rect.height - 8);
+      const left = clamp(moveEvent.clientX - offsetX, 8, maxLeft);
+      const top = clamp(moveEvent.clientY - offsetY, 8, maxTop);
+      applyLauncherPosition({ left, top });
+    };
+
+    const finishDrag = (upEvent) => {
+      launcher.classList.remove("dragging");
+      launcher.releasePointerCapture(upEvent.pointerId);
+      launcher.removeEventListener("pointermove", onPointerMove);
+      launcher.removeEventListener("pointerup", finishDrag);
+      launcher.removeEventListener("pointercancel", finishDrag);
+
+      if (moved) {
+        const finalRect = launcher.getBoundingClientRect();
+        saveLauncherPosition({ left: finalRect.left, top: finalRect.top });
+        suppressLauncherClick = true;
+      }
+    };
+
+    launcher.addEventListener("pointermove", onPointerMove);
+    launcher.addEventListener("pointerup", finishDrag);
+    launcher.addEventListener("pointercancel", finishDrag);
+  });
+
+  window.addEventListener("resize", () => {
+    clampLauncherToViewport({ persist: true });
+  });
+
+  window.addEventListener("orientationchange", () => {
+    clampLauncherToViewport({ persist: true });
+  });
+
   closeButton.addEventListener("click", hideModal);
   overlay.addEventListener("click", hideModal);
 
@@ -500,15 +610,20 @@
     }
   });
 
-  const computeStartOfWeek = (weekStartsOn, anchorDate) => {
+  const computeStartOfWeek = (anchorDate) => {
     const base = anchorDate instanceof Date && !Number.isNaN(anchorDate.getTime()) ? anchorDate : new Date();
-    const startOfWeek = getWeekStartDate(base, weekStartsOn);
+    const startOfWeek = getWeekStartDate(base, FIXED_WEEK_STARTS_ON);
     return {
       startOfWeek,
       startOfWeekDate: startOfWeek.toISOString().slice(0, 10),
       startOfWeekIso: startOfWeek.toISOString()
     };
   };
+
+  const sleep = (milliseconds) =>
+    new Promise((resolve) => {
+      window.setTimeout(resolve, milliseconds);
+    });
 
   const buildHeaders = () => {
     const token = document.querySelector('meta[name="csrf-token"]')?.getAttribute("content") || "";
@@ -603,6 +718,130 @@
     return tickets;
   };
 
+  const chunkArray = (values = [], chunkSize = 100) => {
+    const chunks = [];
+    for (let i = 0; i < values.length; i += chunkSize) {
+      chunks.push(values.slice(i, i + chunkSize));
+    }
+    return chunks;
+  };
+
+  const uniqueNumericIds = (values = []) => {
+    const seen = new Set();
+    const result = [];
+
+    for (const value of values) {
+      const asNumber = Number(value);
+      if (!Number.isFinite(asNumber) || asNumber <= 0) {
+        continue;
+      }
+      if (seen.has(asNumber)) {
+        continue;
+      }
+      seen.add(asNumber);
+      result.push(asNumber);
+    }
+
+    return result;
+  };
+
+  const fetchUsersByIds = async (userIds = [], onProgress) => {
+    const ids = uniqueNumericIds(userIds);
+    const userMap = new Map();
+
+    if (!ids.length) {
+      return userMap;
+    }
+
+    const chunks = chunkArray(ids, 100);
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      onProgress?.(`Resolving requester names ${i + 1}/${chunks.length}...`);
+      const params = new URLSearchParams({ ids: chunk.join(",") });
+      const { response, data, url } = await fetchJson(`${BASE}/api/v2/users/show_many.json?${params.toString()}`);
+
+      if (!response.ok) {
+        throw new Error(`Requester name lookup failed (${response.status}) at ${url}`);
+      }
+
+      const users = Array.isArray(data?.users) ? data.users : [];
+      for (const user of users) {
+        const id = user?.id;
+        if (!id) {
+          continue;
+        }
+        const label = String(user?.name || user?.email || id);
+        userMap.set(Number(id), label);
+      }
+    }
+
+    return userMap;
+  };
+
+  const fetchOrganizationsByIds = async (organizationIds = [], onProgress) => {
+    const ids = uniqueNumericIds(organizationIds);
+    const organizationMap = new Map();
+
+    if (!ids.length) {
+      return organizationMap;
+    }
+
+    const chunks = chunkArray(ids, 100);
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      onProgress?.(`Resolving org names ${i + 1}/${chunks.length}...`);
+      const params = new URLSearchParams({ ids: chunk.join(",") });
+      const { response, data, url } = await fetchJson(`${BASE}/api/v2/organizations/show_many.json?${params.toString()}`);
+
+      if (!response.ok) {
+        throw new Error(`Organization name lookup failed (${response.status}) at ${url}`);
+      }
+
+      const organizations = Array.isArray(data?.organizations) ? data.organizations : [];
+      for (const organization of organizations) {
+        const id = organization?.id;
+        if (!id) {
+          continue;
+        }
+        const label = String(organization?.name || id);
+        organizationMap.set(Number(id), label);
+      }
+    }
+
+    return organizationMap;
+  };
+
+  const enrichRowsWithNames = (rows = [], organizationMap = new Map(), userMap = new Map()) => {
+    if (!Array.isArray(rows)) {
+      return rows;
+    }
+
+    for (const row of rows) {
+      const orgId = Number(row?.organization_id);
+      const requesterId = Number(row?.requester_id);
+
+      row.organization_name = Number.isFinite(orgId) ? organizationMap.get(orgId) || null : null;
+      row.requester_name = Number.isFinite(requesterId) ? userMap.get(requesterId) || null : null;
+    }
+
+    return rows;
+  };
+
+  const enrichReportsWithNames = async (reports = [], onProgress) => {
+    const allRows = reports.flatMap((report) => (Array.isArray(report?.ticket_rows) ? report.ticket_rows : []));
+    const organizationIds = allRows.map((row) => row?.organization_id).filter((value) => value !== null && value !== undefined);
+    const requesterIds = allRows.map((row) => row?.requester_id).filter((value) => value !== null && value !== undefined);
+
+    const [organizationMap, userMap] = await Promise.all([
+      fetchOrganizationsByIds(organizationIds, onProgress),
+      fetchUsersByIds(requesterIds, onProgress)
+    ]);
+
+    for (const report of reports) {
+      enrichRowsWithNames(report.ticket_rows, organizationMap, userMap);
+    }
+  };
+
   const pickTicketIdentity = (ticket) => ({
     ticket_id: ticket?.id ?? null,
     organization_id: ticket?.organization_id ?? null,
@@ -613,7 +852,7 @@
     const query = `type:ticket assignee:${assigneeKeyword} created>=${startOfWeekDate}`;
     const tickets = await searchAllTickets({ query, onProgress });
     return {
-      name: "Assigned + Created This Week",
+      name: "Tickets Taken This Week",
       query,
       total: tickets.length,
       ticket_rows: tickets.map(pickTicketIdentity)
@@ -642,10 +881,21 @@
     };
   };
 
-  const runTakeoverReport = async ({ assigneeKeyword, myUserId, startOfWeekDate, startOfWeekIso, maxTicketsToAudit, onProgress }) => {
+  const runCarriedOverTickets = async ({ assigneeKeyword, startOfWeekDate, onProgress }) => {
+    const query = `type:ticket assignee:${assigneeKeyword} created<${startOfWeekDate} updated>=${startOfWeekDate} -status:solved -status:closed`;
+    const tickets = await searchAllTickets({ query, onProgress });
+    return {
+      name: "Carried Over",
+      query,
+      total: tickets.length,
+      ticket_rows: tickets.map(pickTicketIdentity)
+    };
+  };
+
+  const runTakeoverReport = async ({ assigneeKeyword, myUserId, startOfWeekDate, startOfWeekIso, onProgress }) => {
     const query = `type:ticket assignee:${assigneeKeyword} updated>=${startOfWeekDate}`;
     const candidateTickets = await searchAllTickets({ query, onProgress });
-    const limited = candidateTickets.slice(0, maxTicketsToAudit);
+    const limited = candidateTickets;
 
     const takeoverRows = [];
 
@@ -699,6 +949,12 @@
 
         nextAuditUrl = data?.next_page || null;
       }
+
+      const processed = i + 1;
+      if (processed % TAKEOVER_BATCH_SIZE === 0 && processed < limited.length) {
+        onProgress?.(`Pausing ${Math.round(TAKEOVER_BATCH_SLEEP_MS / 1000)}s after ${processed} audits...`);
+        await sleep(TAKEOVER_BATCH_SLEEP_MS);
+      }
     }
 
     const uniqueTicketIds = [...new Set(takeoverRows.map((row) => row.ticket_id))];
@@ -726,8 +982,7 @@
   };
 
   const snapWeekDateInput = () => {
-    const weekStartsOn = Number(weekStartSelect.value || DEFAULT_WEEK_STARTS_ON);
-    const snapped = getWeekStartDate(getAnchorDate(), weekStartsOn);
+    const snapped = getWeekStartDate(getAnchorDate(), FIXED_WEEK_STARTS_ON);
     const snappedIso = snapped.toISOString().slice(0, 10);
 
     if (flatpickrInstance) {
@@ -748,14 +1003,13 @@
         allowInput: true,
         disableMobile: true,
         locale: {
-          firstDayOfWeek: Number(weekStartSelect.value || DEFAULT_WEEK_STARTS_ON)
+          firstDayOfWeek: FIXED_WEEK_STARTS_ON
         },
         onChange: (selectedDates) => {
           if (isSnappingDate || !selectedDates?.length) {
             return;
           }
-          const weekStartsOn = Number(weekStartSelect.value || DEFAULT_WEEK_STARTS_ON);
-          const snapped = getWeekStartDate(selectedDates[0], weekStartsOn);
+          const snapped = getWeekStartDate(selectedDates[0], FIXED_WEEK_STARTS_ON);
           isSnappingDate = true;
           flatpickrInstance.setDate(snapped, true, "Y-m-d");
           isSnappingDate = false;
@@ -776,14 +1030,22 @@
     }
   };
 
-  weekStartSelect.addEventListener("change", () => {
-    if (flatpickrInstance) {
-      flatpickrInstance.set("locale", {
-        firstDayOfWeek: Number(weekStartSelect.value || DEFAULT_WEEK_STARTS_ON)
-      });
-    }
-    snapWeekDateInput();
-  });
+  window.zdWeeklyReportPopup = {
+    ...(window.zdWeeklyReportPopup || {}),
+    setAssignee: (keyword) => {
+      const normalized = String(keyword ?? "").trim();
+      assigneeOverrideKeyword = normalized || null;
+      const effective = assigneeOverrideKeyword || ASSIGNEE_FALLBACK_KEYWORD;
+      statusEl.textContent = `Assignee override set to: ${effective}`;
+      return effective;
+    },
+    clearAssignee: () => {
+      assigneeOverrideKeyword = null;
+      statusEl.textContent = `Assignee override cleared. Using ${ASSIGNEE_FALLBACK_KEYWORD}.`;
+      return ASSIGNEE_FALLBACK_KEYWORD;
+    },
+    getAssignee: () => assigneeOverrideKeyword || ASSIGNEE_FALLBACK_KEYWORD
+  };
 
   const renderTicketChips = (rows = []) => {
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -840,24 +1102,106 @@
 
   const renderTable = (rows = [], title) => {
     if (!rows.length) return "";
+
+    const toSafeText = (value) => {
+      const text = value === null || value === undefined ? "" : String(value);
+      return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    };
+
+    const formatEntity = (name, id) => {
+      const idText = id === null || id === undefined ? "" : String(id);
+      const nameText = name === null || name === undefined || String(name).trim() === "" ? "" : String(name);
+
+      if (nameText && idText) {
+        return `${toSafeText(nameText)} <span class="zd-subline">(${toSafeText(idText)})</span>`;
+      }
+      if (nameText) {
+        return toSafeText(nameText);
+      }
+      return toSafeText(idText);
+    };
+
     const limited = rows.slice(0, 25);
     const header = `
       <tr>
         <th>Ticket</th>
-        <th>Org</th>
+        <th>Organization</th>
         <th>Requester</th>
       </tr>`;
     const body = limited
       .map(
         (row) => `
         <tr>
-          <td>${row.ticket_id ?? ""}</td>
-          <td>${row.organization_id ?? ""}</td>
-          <td>${row.requester_id ?? ""}</td>
+          <td>${toSafeText(row.ticket_id ?? "")}</td>
+          <td>${formatEntity(row.organization_name, row.organization_id)}</td>
+          <td>${formatEntity(row.requester_name, row.requester_id)}</td>
         </tr>`
       )
       .join("");
     const more = rows.length > limited.length ? `<div class="zd-subline">Showing first ${limited.length} of ${rows.length}</div>` : "";
+    return `
+      <div class="zd-section-title">${title}</div>
+      <table class="zd-table">${header}${body}</table>
+      ${more}
+    `;
+  };
+
+  const renderEntityCountTable = ({
+    rows = [],
+    title = "",
+    nameKey = "organization_name",
+    idKey = "organization_id",
+    label = "Entity"
+  } = {}) => {
+    if (!rows.length) return "";
+
+    const toSafeText = (value) => {
+      const text = value === null || value === undefined ? "" : String(value);
+      return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    };
+
+    const counter = new Map();
+
+    for (const row of rows) {
+      const rawName = row?.[nameKey];
+      const rawId = row?.[idKey];
+      const idText = rawId === null || rawId === undefined || String(rawId).trim() === "" ? "Unknown" : String(rawId);
+      const nameText = rawName === null || rawName === undefined || String(rawName).trim() === "" ? "Unknown" : String(rawName);
+      const key = `${idText}::${nameText}`;
+      const existing = counter.get(key) || { idText, nameText, count: 0 };
+      existing.count += 1;
+      counter.set(key, existing);
+    }
+
+    const sorted = [...counter.values()].sort((a, b) => b.count - a.count || a.nameText.localeCompare(b.nameText));
+    const limited = sorted.slice(0, 50);
+
+    const header = `
+      <tr>
+        <th>${label}</th>
+        <th>Count</th>
+      </tr>`;
+    const body = limited
+      .map(
+        (entry) => `
+        <tr>
+          <td>${toSafeText(entry.nameText)} <span class="zd-subline">(${toSafeText(entry.idText)})</span></td>
+          <td>${entry.count}</td>
+        </tr>`
+      )
+      .join("");
+    const more = sorted.length > limited.length ? `<div class="zd-subline">Showing top ${limited.length} of ${sorted.length}</div>` : "";
+
     return `
       <div class="zd-section-title">${title}</div>
       <table class="zd-table">${header}${body}</table>
@@ -874,7 +1218,27 @@
     return ids.join(", ");
   };
 
-  const buildReportDraft = ({ meta, report1, report2, reportOpen, report3 }) => {
+  const uniqueRowsByTicketId = (rows = []) => {
+    const seen = new Set();
+    const unique = [];
+
+    for (const row of rows) {
+      const ticketId = row?.ticket_id;
+      if (ticketId === null || ticketId === undefined || String(ticketId).trim() === "") {
+        continue;
+      }
+      const key = String(ticketId);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      unique.push(row);
+    }
+
+    return unique;
+  };
+
+  const buildReportDraft = ({ meta, report1, report2, reportOpen, reportCarry, report3 }) => {
     const takeoverRows = Array.isArray(report3.ticket_rows) ? report3.ticket_rows : [];
     const takeoverPreview = takeoverRows
       .slice(0, 20)
@@ -885,22 +1249,20 @@
     return [
       "Zendesk Weekly Report",
       `Generated: ${meta.generated_at}`,
-      `Assignee: ${meta.assignee_input || "(blank -> me)"} [keyword: ${meta.assignee}]`,
-      `Week anchor date: ${meta.anchor_date}`,
-      `Week starts on: ${meta.week_starts_on}`,
-      `Range start: ${meta.start_of_week_date}`,
       "",
       "Summary",
-      `- Assigned + Created This Week: ${report1.total}`,
+      `- Tickets Taken This Week: ${report1.total}`,
       `- Assigned + Solved + Updated This Week: ${report2.total}`,
       `- Open Tickets Remaining: ${reportOpen.total}`,
+      `- Carried Over: ${reportCarry.total}`,
       `- Takeovers This Week: ${report3.total_unique_tickets} unique tickets (${report3.total_takeover_events} events)` ,
       `- Takeover audits coverage: ${report3.candidate_audited}/${report3.candidate_total}`,
       "",
       "Ticket IDs",
-      `- Created: ${asIdList(report1.ticket_rows)}`,
+      `- Taken: ${asIdList(report1.ticket_rows)}`,
       `- Solved/Updated: ${asIdList(report2.ticket_rows)}`,
       `- Open Remaining: ${asIdList(reportOpen.ticket_rows)}`,
+      `- Carried Over: ${asIdList(reportCarry.ticket_rows)}`,
       `- Takeover Tickets: ${asIdList(report3.ticket_rows)}`,
       "",
       "Takeover Events (sample)",
@@ -909,14 +1271,22 @@
     ].join("\n");
   };
 
-  const renderOutput = ({ meta, report1, report2, reportOpen, report3 }) => {
-    const reportDraft = buildReportDraft({ meta, report1, report2, reportOpen, report3 });
+  const renderOutput = ({ meta, report1, report2, reportOpen, reportCarry, report3 }) => {
+    const reportDraft = buildReportDraft({ meta, report1, report2, reportOpen, reportCarry, report3 });
+    const aggregateRows = uniqueRowsByTicketId([
+      ...(Array.isArray(report1.ticket_rows) ? report1.ticket_rows : []),
+      ...(Array.isArray(report2.ticket_rows) ? report2.ticket_rows : []),
+      ...(Array.isArray(reportOpen.ticket_rows) ? reportOpen.ticket_rows : []),
+      ...(Array.isArray(reportCarry.ticket_rows) ? reportCarry.ticket_rows : []),
+      ...(Array.isArray(report3.ticket_rows) ? report3.ticket_rows : [])
+    ]);
 
     const summaryCards = `
       <div class="zd-card-grid">
-        ${renderReportCard(report1, { subtitle: `Created since ${meta.start_of_week_date}` })}
+        ${renderReportCard(report1, { subtitle: `Taken since ${meta.start_of_week_date}` })}
         ${renderReportCard(report2, { subtitle: `Solved & updated since ${meta.start_of_week_date}` })}
         ${renderReportCard(reportOpen, { subtitle: "Currently open" })}
+        ${renderReportCard(reportCarry, { subtitle: `Created before, updated since ${meta.start_of_week_date}, not solved` })}
         ${renderTakeoverCard(report3)}
       </div>
     `;
@@ -925,7 +1295,10 @@
       ${renderTable(report1.ticket_rows, report1.name)}
       ${renderTable(report2.ticket_rows, report2.name)}
       ${renderTable(reportOpen.ticket_rows, reportOpen.name)}
+      ${renderTable(reportCarry.ticket_rows, reportCarry.name)}
       ${renderTable(report3.ticket_rows, `${report3.name} (events)`) }
+      ${renderEntityCountTable({ rows: aggregateRows, title: "Report Count by Organization", nameKey: "organization_name", idKey: "organization_id", label: "Organization" })}
+      ${renderEntityCountTable({ rows: aggregateRows, title: "Report Count by Requester", nameKey: "requester_name", idKey: "requester_id", label: "Requester" })}
       <div class="zd-report-draft">
         <h4>Copy-ready report draft</h4>
         <textarea id="zd-report-draft-text" readonly></textarea>
@@ -936,12 +1309,6 @@
       <div class="zd-meta-card">
         <div class="zd-section-title">Run Meta</div>
         <div class="zd-meta-grid">
-          <div><span>Assignee keyword</span><strong>${meta.assignee}</strong></div>
-          <div><span>Assignee input</span><strong>${meta.assignee_input || "(blank → me)"}</strong></div>
-          <div><span>Week starts on</span><strong>${meta.week_starts_on}</strong></div>
-          <div><span>Week anchor date</span><strong>${meta.anchor_date}</strong></div>
-          <div><span>Start of week</span><strong>${meta.start_of_week_date}</strong></div>
-          <div><span>Max audits</span><strong>${meta.max_tickets_to_audit}</strong></div>
           <div><span>Generated</span><strong>${meta.generated_at}</strong></div>
         </div>
       </div>
@@ -961,12 +1328,9 @@
     runButton.disabled = true;
     outputEl.innerHTML = '<div class="zd-placeholder">Running...</div>';
 
-    const weekStartsOn = Number(weekStartSelect.value || DEFAULT_WEEK_STARTS_ON);
-    const maxTicketsToAudit = Number(maxAuditsInput.value || DEFAULT_MAX_TICKETS_TO_AUDIT);
-    const assigneeRaw = String(assigneeInput.value || "").trim();
-    const assigneeKeyword = assigneeRaw || ASSIGNEE_FALLBACK_KEYWORD;
+    const assigneeKeyword = assigneeOverrideKeyword || ASSIGNEE_FALLBACK_KEYWORD;
     const anchorDate = getAnchorDate();
-    const { startOfWeekDate, startOfWeekIso } = computeStartOfWeek(weekStartsOn, anchorDate);
+    const { startOfWeekDate, startOfWeekIso } = computeStartOfWeek(anchorDate);
 
     const progress = (msg) => {
       statusEl.textContent = msg;
@@ -976,49 +1340,61 @@
       progress("Resolving target assignee user...");
       const myUserId = await resolveUserIdFromAssigneeInput(assigneeKeyword);
 
-      progress("Running report 1/4...");
+      progress("Running report 1/5...");
       const report1 = await runAssignedCreatedThisWeek({ assigneeKeyword, startOfWeekDate, onProgress: progress });
 
-      progress("Running report 2/4...");
+      progress("Running report 2/5...");
       const report2 = await runAssignedSolvedUpdatedThisWeek({ assigneeKeyword, startOfWeekDate, onProgress: progress });
 
-      progress("Running report 3/4...");
+      progress("Running report 3/5...");
       const reportOpen = await runOpenTicketsRemaining({ assigneeKeyword, onProgress: progress });
 
-      progress("Running report 4/4 (audits)...");
+      progress("Running report 4/5...");
+      const reportCarry = await runCarriedOverTickets({ assigneeKeyword, startOfWeekDate, onProgress: progress });
+
+      progress("Running report 5/5 (audits)...");
       const report3 = await runTakeoverReport({
         assigneeKeyword,
         myUserId,
         startOfWeekDate,
         startOfWeekIso,
-        maxTicketsToAudit,
         onProgress: progress
       });
 
+      try {
+        progress("Resolving organization/requester names...");
+        await enrichReportsWithNames([report1, report2, reportOpen, reportCarry, report3], progress);
+      } catch (nameError) {
+        console.warn("Name resolution failed; continuing with IDs only.", nameError);
+        progress("Name resolution partially failed; continuing with IDs.");
+      }
+
       const meta = {
         assignee: assigneeKeyword,
-        assignee_input: assigneeRaw || null,
+        assignee_source: assigneeOverrideKeyword ? "override" : "default (me)",
         current_user_id: myUserId,
-        week_starts_on: weekStartsOn === 1 ? "Monday" : "Sunday",
+        week_starts_on: "Sunday",
         start_of_week_date: startOfWeekDate,
         start_of_week_iso: startOfWeekIso,
         anchor_date: anchorDate.toISOString().slice(0, 10),
-        max_tickets_to_audit: maxTicketsToAudit,
+        takeover_batch_size: TAKEOVER_BATCH_SIZE,
+        takeover_pause_seconds: Math.round(TAKEOVER_BATCH_SLEEP_MS / 1000),
         generated_at: new Date().toISOString()
       };
 
-      renderOutput({ meta, report1, report2, reportOpen, report3 });
+      renderOutput({ meta, report1, report2, reportOpen, reportCarry, report3 });
 
       latestRawOutput = [
         toTextBlock("Run Meta", meta),
         toTextBlock(report1.name, report1),
         toTextBlock(report2.name, report2),
         toTextBlock(reportOpen.name, reportOpen),
+        toTextBlock(reportCarry.name, reportCarry),
         toTextBlock(report3.name, report3)
       ].join("\n");
 
       statusEl.textContent = "Done. UI shows summaries; Copy JSON for full raw payload.";
-      console.log("Zendesk weekly reports:", { meta, report1, report2, reportOpen, report3 });
+      console.log("Zendesk weekly reports:", { meta, report1, report2, reportOpen, reportCarry, report3 });
     } catch (error) {
       outputEl.innerHTML = `<div class="zd-placeholder">Error: ${error?.message || error}</div>`;
       statusEl.textContent = "Failed.";
@@ -1029,4 +1405,6 @@
   });
 
   initDatePicker();
+  loadLauncherPosition();
+  clampLauncherToViewport({ persist: true });
 })();
