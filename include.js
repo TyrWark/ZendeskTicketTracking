@@ -613,10 +613,15 @@
   const computeStartOfWeek = (anchorDate) => {
     const base = anchorDate instanceof Date && !Number.isNaN(anchorDate.getTime()) ? anchorDate : new Date();
     const startOfWeek = getWeekStartDate(base, FIXED_WEEK_STARTS_ON);
+    const endOfWeek = new Date(startOfWeek);
+    endOfWeek.setDate(endOfWeek.getDate() + 7);
     return {
       startOfWeek,
       startOfWeekDate: startOfWeek.toISOString().slice(0, 10),
-      startOfWeekIso: startOfWeek.toISOString()
+      startOfWeekIso: startOfWeek.toISOString(),
+      endOfWeek,
+      endOfWeekDate: endOfWeek.toISOString().slice(0, 10),
+      endOfWeekIso: endOfWeek.toISOString()
     };
   };
 
@@ -649,6 +654,103 @@
       data = null;
     }
     return { response, text, data, url };
+  };
+
+  const fetchIncrementalTicketEvents = async ({ startTimeEpoch, onProgress }) => {
+    const params = new URLSearchParams({
+      start_time: String(startTimeEpoch),
+      include: "comment_events",
+      per_page: "1000"
+    });
+    let nextUrl = `${BASE}/api/v2/incremental/ticket_events.json?${params.toString()}`;
+    const ticketEvents = [];
+    let page = 0;
+
+    while (nextUrl) {
+      page += 1;
+      onProgress?.(`Message events page ${page}...`);
+      const { response, data, url } = await fetchJson(nextUrl);
+
+      if (!response.ok) {
+        const error = new Error(`Incremental ticket events failed (${response.status}) at ${url}`);
+        error.status = response.status;
+        throw error;
+      }
+
+      const events = Array.isArray(data?.ticket_events) ? data.ticket_events : [];
+      ticketEvents.push(...events);
+      nextUrl = data?.next_page || null;
+
+      if (!events.length || data?.end_of_stream) {
+        break;
+      }
+    }
+
+    return ticketEvents;
+  };
+
+  const extractIncrementalCommentEvents = (ticketEvent) => {
+    const directEvents = Array.isArray(ticketEvent?.events) ? ticketEvent.events : [];
+    const childEvents = Array.isArray(ticketEvent?.child_events) ? ticketEvent.child_events : [];
+    const commentEvents = [...childEvents, ...directEvents].filter((event) => event?.type === "Comment");
+
+    if (!commentEvents.length) {
+      return [];
+    }
+
+    return commentEvents.map((event) => ({
+      id: event?.id ?? null,
+      ticket_id: ticketEvent?.ticket_id ?? ticketEvent?.id ?? null,
+      author_id: event?.author_id ?? ticketEvent?.author_id ?? null,
+      via_channel: event?.via?.channel ?? ticketEvent?.via?.channel ?? null,
+      created_at: event?.created_at || ticketEvent?.created_at || null,
+      public: Boolean(event?.public ?? event?.comment_public),
+      source: Array.isArray(ticketEvent?.child_events) && ticketEvent.child_events.includes(event) ? "child_event" : "event"
+    }));
+  };
+
+  const dedupeMessageRows = (rows = []) => {
+    const seen = new Set();
+    const unique = [];
+
+    for (const row of rows) {
+      const dedupeKey = row?.id ? `comment:${row.id}` : `${row?.ticket_id || "?"}:${row?.created_at || "?"}:${row?.public ? "public" : "private"}:${row?.via_channel || "unknown"}`;
+      if (seen.has(dedupeKey)) {
+        continue;
+      }
+      seen.add(dedupeKey);
+      unique.push(row);
+    }
+
+    return unique;
+  };
+
+  const buildMessageDebugTable = (rows = []) => {
+    const grouped = new Map();
+
+    for (const row of rows) {
+      const ticketId = row?.ticket_id ?? null;
+      const authorId = row?.author_id ?? null;
+      const key = `${ticketId ?? "unknown"}:${authorId ?? "unknown"}`;
+      const existing = grouped.get(key) || {
+        ticket_id: ticketId,
+        author_id: authorId,
+        matched_event_ids: []
+      };
+
+      if (row?.id !== null && row?.id !== undefined) {
+        existing.matched_event_ids.push(row.id);
+      }
+
+      grouped.set(key, existing);
+    }
+
+    return [...grouped.values()].map((entry) => ({
+      ticket_id: entry.ticket_id,
+      author_id: entry.author_id,
+      matched_event_count: entry.matched_event_ids.length,
+      matched_event_ids: entry.matched_event_ids.join(", ")
+    }));
   };
 
   const getCurrentUserId = async () => {
@@ -848,8 +950,8 @@
     requester_id: ticket?.requester_id ?? null
   });
 
-  const runAssignedCreatedThisWeek = async ({ assigneeKeyword, startOfWeekDate, onProgress }) => {
-    const query = `type:ticket assignee:${assigneeKeyword} created>=${startOfWeekDate}`;
+  const runAssignedCreatedThisWeek = async ({ assigneeKeyword, startOfWeekDate, endOfWeekDate, onProgress }) => {
+    const query = `type:ticket assignee:${assigneeKeyword} created>=${startOfWeekDate} created<${endOfWeekDate}`;
     const tickets = await searchAllTickets({ query, onProgress });
     return {
       name: "Tickets Taken This Week",
@@ -859,8 +961,8 @@
     };
   };
 
-  const runAssignedSolvedUpdatedThisWeek = async ({ assigneeKeyword, startOfWeekDate, onProgress }) => {
-    const query = `type:ticket assignee:${assigneeKeyword} status:solved updated>=${startOfWeekDate}`;
+  const runAssignedSolvedUpdatedThisWeek = async ({ assigneeKeyword, startOfWeekDate, endOfWeekDate, onProgress }) => {
+    const query = `type:ticket assignee:${assigneeKeyword} status:solved updated>=${startOfWeekDate} updated<${endOfWeekDate}`;
     const tickets = await searchAllTickets({ query, onProgress });
     return {
       name: "Assigned + Solved + Updated This Week",
@@ -870,8 +972,8 @@
     };
   };
 
-  const runOpenTicketsRemaining = async ({ assigneeKeyword, onProgress }) => {
-    const query = `type:ticket assignee:${assigneeKeyword} status:open`;
+  const runOpenTicketsRemaining = async ({ assigneeKeyword, endOfWeekDate, onProgress }) => {
+    const query = `type:ticket assignee:${assigneeKeyword} status:open created<${endOfWeekDate}`;
     const tickets = await searchAllTickets({ query, onProgress });
     return {
       name: "Open Tickets Remaining",
@@ -881,8 +983,8 @@
     };
   };
 
-  const runCarriedOverTickets = async ({ assigneeKeyword, startOfWeekDate, onProgress }) => {
-    const query = `type:ticket assignee:${assigneeKeyword} created<${startOfWeekDate} updated>=${startOfWeekDate} -status:solved -status:closed`;
+  const runCarriedOverTickets = async ({ assigneeKeyword, startOfWeekDate, endOfWeekDate, onProgress }) => {
+    const query = `type:ticket assignee:${assigneeKeyword} created<${startOfWeekDate} updated>=${startOfWeekDate} updated<${endOfWeekDate} -status:solved -status:closed`;
     const tickets = await searchAllTickets({ query, onProgress });
     return {
       name: "Carried Over",
@@ -892,8 +994,8 @@
     };
   };
 
-  const runTakeoverReport = async ({ assigneeKeyword, myUserId, startOfWeekDate, startOfWeekIso, onProgress }) => {
-    const query = `type:ticket assignee:${assigneeKeyword} updated>=${startOfWeekDate}`;
+  const runTakeoverReport = async ({ assigneeKeyword, myUserId, startOfWeekDate, endOfWeekDate, startOfWeekIso, endOfWeekIso, onProgress }) => {
+    const query = `type:ticket assignee:${assigneeKeyword} updated>=${startOfWeekDate} updated<${endOfWeekDate}`;
     const candidateTickets = await searchAllTickets({ query, onProgress });
     const limited = candidateTickets;
 
@@ -920,7 +1022,7 @@
 
         for (const audit of audits) {
           const auditCreatedAt = audit?.created_at;
-          if (!auditCreatedAt || auditCreatedAt < startOfWeekIso) {
+          if (!auditCreatedAt || auditCreatedAt < startOfWeekIso || auditCreatedAt >= endOfWeekIso) {
             continue;
           }
 
@@ -1100,6 +1202,46 @@
     `;
   };
 
+  const renderMessagesTable = (rows = [], title) => {
+    if (!rows.length) return "";
+
+    const toSafeText = (value) => {
+      const text = value === null || value === undefined ? "" : String(value);
+      return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    };
+
+    const limited = rows.slice(0, 25);
+    const header = `
+      <tr>
+        <th>Ticket</th>
+        <th>Channel</th>
+        <th>Public</th>
+        <th>Sent At</th>
+      </tr>`;
+    const body = limited
+      .map(
+        (row) => `
+        <tr>
+          <td>${toSafeText(row.ticket_id ?? "")}</td>
+          <td>${toSafeText(row.via_channel ?? "")}</td>
+          <td>${row.public ? "Yes" : "No"}</td>
+          <td>${toSafeText(row.created_at ?? "")}</td>
+        </tr>`
+      )
+      .join("");
+    const more = rows.length > limited.length ? `<div class="zd-subline">Showing first ${limited.length} of ${rows.length}</div>` : "";
+    return `
+      <div class="zd-section-title">${title}</div>
+      <table class="zd-table">${header}${body}</table>
+      ${more}
+    `;
+  };
+
   const renderTable = (rows = [], title) => {
     if (!rows.length) return "";
 
@@ -1238,13 +1380,206 @@
     return unique;
   };
 
-  const buildReportDraft = ({ meta, report1, report2, reportOpen, reportCarry, report3 }) => {
-    const takeoverRows = Array.isArray(report3.ticket_rows) ? report3.ticket_rows : [];
-    const takeoverPreview = takeoverRows
-      .slice(0, 20)
-      .map((row) => `- #${row.ticket_id ?? "?"}: ${row.previous_assignee_id ?? "?"} -> ${row.new_assignee_id ?? "?"} at ${row.takeover_at ?? "?"}`)
-      .join("\n");
-    const takeoverMore = takeoverRows.length > 20 ? `\n- ... (+${takeoverRows.length - 20} more takeover events)` : "";
+  const runMessagesSentThisWeek = async ({ assigneeKeyword, authorId, startOfWeekDate, endOfWeekDate, startOfWeekIso, endOfWeekIso, onProgress }) => {
+    const query = `type:ticket assignee:${assigneeKeyword} updated>=${startOfWeekDate} updated<${endOfWeekDate}`;
+    const candidateTickets = await searchAllTickets({ query, onProgress });
+    const rows = [];
+
+    for (let i = 0; i < candidateTickets.length; i += 1) {
+      const ticket = candidateTickets[i];
+      const ticketId = ticket?.id;
+      if (!ticketId) continue;
+
+      onProgress?.(`Message audits ${i + 1}/${candidateTickets.length} (ticket ${ticketId})...`);
+      let nextAuditUrl = `${BASE}/api/v2/tickets/${ticketId}/audits.json`;
+
+      while (nextAuditUrl) {
+        const { response, data, url } = await fetchJson(nextAuditUrl);
+
+        if (!response.ok) {
+          throw new Error(`Message audit fetch failed (${response.status}) at ${url}`);
+        }
+
+        const audits = Array.isArray(data?.audits) ? data.audits : [];
+        for (const audit of audits) {
+          const auditCreatedAt = audit?.created_at;
+          if (!auditCreatedAt || auditCreatedAt < startOfWeekIso || auditCreatedAt >= endOfWeekIso) {
+            continue;
+          }
+
+          const authoredByMe = String(audit?.author_id) === String(authorId);
+          if (!authoredByMe) {
+            continue;
+          }
+
+          const events = Array.isArray(audit?.events) ? audit.events : [];
+          for (const event of events) {
+            if (event?.type !== "Comment") {
+              continue;
+            }
+
+            rows.push({
+              id: event?.id ?? null,
+              ticket_id: ticketId,
+              organization_id: ticket?.organization_id ?? null,
+              requester_id: ticket?.requester_id ?? null,
+              author_id: audit?.author_id ?? null,
+              via_channel: event?.via?.channel ?? audit?.via?.channel ?? null,
+              created_at: event?.created_at || auditCreatedAt,
+              public: Boolean(event?.public)
+            });
+          }
+        }
+
+        nextAuditUrl = data?.next_page || null;
+      }
+
+      const processed = i + 1;
+      if (processed % TAKEOVER_BATCH_SIZE === 0 && processed < candidateTickets.length) {
+        onProgress?.(`Pausing ${Math.round(TAKEOVER_BATCH_SLEEP_MS / 1000)}s after ${processed} message audits...`);
+        await sleep(TAKEOVER_BATCH_SLEEP_MS);
+      }
+    }
+
+    const uniqueRows = dedupeMessageRows(rows);
+    const internalNoteRows = uniqueRows.filter((row) => !row.public);
+    const publicReplyRows = uniqueRows.filter((row) => row.public);
+
+    return {
+      name: "Messages Sent This Week",
+      query,
+      candidate_total: candidateTickets.length,
+      total: uniqueRows.length,
+      total_public_replies: publicReplyRows.length,
+      total_internal_notes: internalNoteRows.length,
+      total_public: uniqueRows.filter((row) => row.public).length,
+      total_private: internalNoteRows.length,
+      ticket_rows: uniqueRows
+    };
+  };
+
+  const runMessagesSentThisWeekViaAudits = async ({ authorId, startOfWeekDate, endOfWeekDate, onProgress }) => {
+    const query = `type:ticket updater:${authorId} updated>=${startOfWeekDate} updated<${endOfWeekDate}`;
+    const tickets = await searchAllTickets({ query, onProgress });
+    const rows = [];
+
+    for (let i = 0; i < tickets.length; i += 1) {
+      const ticket = tickets[i];
+      const ticketId = ticket?.id;
+      if (!ticketId) continue;
+
+      onProgress?.(`Message audits ${i + 1}/${tickets.length} (ticket ${ticketId})...`);
+      let nextAuditUrl = `${BASE}/api/v2/tickets/${ticketId}/audits.json`;
+
+      while (nextAuditUrl) {
+        const { response, data, url } = await fetchJson(nextAuditUrl);
+
+        if (!response.ok) {
+          throw new Error(`Message audit fetch failed (${response.status}) at ${url}`);
+        }
+
+        const audits = Array.isArray(data?.audits) ? data.audits : [];
+        for (const audit of audits) {
+          const auditCreatedAt = audit?.created_at;
+          if (!auditCreatedAt || auditCreatedAt < `${startOfWeekDate}T00:00:00Z` || auditCreatedAt >= `${endOfWeekDate}T00:00:00Z`) continue;
+
+          const auditAuthorId = audit?.author_id;
+
+          const events = Array.isArray(audit?.events) ? audit.events : [];
+          for (const event of events) {
+            const isComment = event?.type === "Comment";
+            const authoredByMe = String(auditAuthorId) === String(authorId);
+            if (!isComment || !authoredByMe) continue;
+
+            rows.push({
+              id: event?.id ?? null,
+              ticket_id: ticketId,
+              author_id: auditAuthorId ?? null,
+              via_channel: event?.via?.channel ?? audit?.via?.channel ?? null,
+              created_at: event?.created_at || auditCreatedAt,
+              public: Boolean(event?.public)
+            });
+          }
+        }
+
+        nextAuditUrl = data?.next_page || null;
+      }
+
+      const processed = i + 1;
+      if (processed % TAKEOVER_BATCH_SIZE === 0 && processed < tickets.length) {
+        onProgress?.(`Pausing ${Math.round(TAKEOVER_BATCH_SLEEP_MS / 1000)}s after ${processed} message audits...`);
+        await sleep(TAKEOVER_BATCH_SLEEP_MS);
+      }
+    }
+
+    const uniqueRows = dedupeMessageRows(rows);
+    const internalNoteRows = uniqueRows.filter((row) => !row.public);
+    const publicReplyRows = uniqueRows.filter((row) => row.public);
+
+    return {
+      name: "Messages Sent This Week",
+      query,
+      total: uniqueRows.length,
+      total_public_replies: publicReplyRows.length,
+      total_internal_notes: internalNoteRows.length,
+      total_public: uniqueRows.filter((row) => row.public).length,
+      total_private: internalNoteRows.length,
+      ticket_rows: uniqueRows
+    };
+  };
+
+  const buildEntityCountLines = ({
+    rows = [],
+    nameKey = "organization_name",
+    idKey = "organization_id"
+  } = {}) => {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return ["- None"];
+    }
+
+    const counter = new Map();
+
+    for (const row of rows) {
+      const rawName = row?.[nameKey];
+      const rawId = row?.[idKey];
+      const idText = rawId === null || rawId === undefined || String(rawId).trim() === "" ? "Unknown" : String(rawId);
+      const nameText = rawName === null || rawName === undefined || String(rawName).trim() === "" ? "Unknown" : String(rawName);
+      const key = `${idText}::${nameText}`;
+      const existing = counter.get(key) || { idText, nameText, count: 0 };
+      existing.count += 1;
+      counter.set(key, existing);
+    }
+
+    const sorted = [...counter.values()].sort((a, b) => b.count - a.count || a.nameText.localeCompare(b.nameText));
+    const limit = 50;
+    const lines = sorted.slice(0, limit).map((entry) => `- ${entry.nameText} (${entry.idText}): ${entry.count}`);
+
+    if (sorted.length > limit) {
+      lines.push(`- ... (+${sorted.length - limit} more)`);
+    }
+
+    return lines;
+  };
+
+  const buildReportDraft = ({ meta, report1, report2, reportOpen, reportCarry, report3, reportMessages }) => {
+    const draftAggregateRows = uniqueRowsByTicketId([
+      ...(Array.isArray(report1.ticket_rows) ? report1.ticket_rows : []),
+      ...(Array.isArray(report2.ticket_rows) ? report2.ticket_rows : []),
+      ...(Array.isArray(reportOpen.ticket_rows) ? reportOpen.ticket_rows : []),
+      ...(Array.isArray(reportCarry.ticket_rows) ? reportCarry.ticket_rows : []),
+      ...(Array.isArray(report3.ticket_rows) ? report3.ticket_rows : []),
+      ...(Array.isArray(reportMessages.ticket_rows) ? reportMessages.ticket_rows : [])
+    ]);
+    const byOrgLines = buildEntityCountLines({
+      rows: draftAggregateRows,
+      nameKey: "organization_name",
+      idKey: "organization_id"
+    });
+    const byRequesterLines = buildEntityCountLines({
+      rows: draftAggregateRows,
+      nameKey: "requester_name",
+      idKey: "requester_id"
+    });
 
     return [
       "Zendesk Weekly Report",
@@ -1255,8 +1590,10 @@
       `- Assigned + Solved + Updated This Week: ${report2.total}`,
       `- Open Tickets Remaining: ${reportOpen.total}`,
       `- Carried Over: ${reportCarry.total}`,
-      `- Takeovers This Week: ${report3.total_unique_tickets} unique tickets (${report3.total_takeover_events} events)` ,
-      `- Takeover audits coverage: ${report3.candidate_audited}/${report3.candidate_total}`,
+      `- Takeovers This Week: ${report3.total_unique_tickets} unique tickets (${report3.total_takeover_events} events)`,
+      `- Messages Sent: ${reportMessages.total}`,
+      `- Public Replies (Emails Sent): ${reportMessages.total_public_replies ?? reportMessages.total_public ?? 0}`,
+      `- Internal Notes: ${reportMessages.total_internal_notes ?? reportMessages.total_private ?? 0}`,
       "",
       "Ticket IDs",
       `- Taken: ${asIdList(report1.ticket_rows)}`,
@@ -1264,21 +1601,25 @@
       `- Open Remaining: ${asIdList(reportOpen.ticket_rows)}`,
       `- Carried Over: ${asIdList(reportCarry.ticket_rows)}`,
       `- Takeover Tickets: ${asIdList(report3.ticket_rows)}`,
+      `- Message Tickets: ${asIdList(reportMessages.ticket_rows)}`,
       "",
-      "Takeover Events (sample)",
-      takeoverPreview || "- None",
-      takeoverMore
+      "By Org",
+      ...byOrgLines,
+      "",
+      "By Requester",
+      ...byRequesterLines
     ].join("\n");
   };
 
-  const renderOutput = ({ meta, report1, report2, reportOpen, reportCarry, report3 }) => {
-    const reportDraft = buildReportDraft({ meta, report1, report2, reportOpen, reportCarry, report3 });
+  const renderOutput = ({ meta, report1, report2, reportOpen, reportCarry, report3, reportMessages }) => {
+    const reportDraft = buildReportDraft({ meta, report1, report2, reportOpen, reportCarry, report3, reportMessages });
     const aggregateRows = uniqueRowsByTicketId([
       ...(Array.isArray(report1.ticket_rows) ? report1.ticket_rows : []),
       ...(Array.isArray(report2.ticket_rows) ? report2.ticket_rows : []),
       ...(Array.isArray(reportOpen.ticket_rows) ? reportOpen.ticket_rows : []),
       ...(Array.isArray(reportCarry.ticket_rows) ? reportCarry.ticket_rows : []),
-      ...(Array.isArray(report3.ticket_rows) ? report3.ticket_rows : [])
+      ...(Array.isArray(report3.ticket_rows) ? report3.ticket_rows : []),
+      ...(Array.isArray(reportMessages.ticket_rows) ? reportMessages.ticket_rows : [])
     ]);
 
     const summaryCards = `
@@ -1288,6 +1629,7 @@
         ${renderReportCard(reportOpen, { subtitle: "Currently open" })}
         ${renderReportCard(reportCarry, { subtitle: `Created before, updated since ${meta.start_of_week_date}, not solved` })}
         ${renderTakeoverCard(report3)}
+        ${renderReportCard(reportMessages, { subtitle: `Comments you authored since ${meta.start_of_week_date}`, extra: [`Public replies (emails sent): ${reportMessages.total_public_replies ?? reportMessages.total_public ?? 0}`, `Internal notes: ${reportMessages.total_internal_notes ?? reportMessages.total_private ?? 0}`] })}
       </div>
     `;
 
@@ -1297,6 +1639,7 @@
       ${renderTable(reportOpen.ticket_rows, reportOpen.name)}
       ${renderTable(reportCarry.ticket_rows, reportCarry.name)}
       ${renderTable(report3.ticket_rows, `${report3.name} (events)`) }
+      ${renderMessagesTable(reportMessages.ticket_rows, reportMessages.name)}
       ${renderEntityCountTable({ rows: aggregateRows, title: "Report Count by Organization", nameKey: "organization_name", idKey: "organization_id", label: "Organization" })}
       ${renderEntityCountTable({ rows: aggregateRows, title: "Report Count by Requester", nameKey: "requester_name", idKey: "requester_id", label: "Requester" })}
       <div class="zd-report-draft">
@@ -1330,7 +1673,7 @@
 
     const assigneeKeyword = assigneeOverrideKeyword || ASSIGNEE_FALLBACK_KEYWORD;
     const anchorDate = getAnchorDate();
-    const { startOfWeekDate, startOfWeekIso } = computeStartOfWeek(anchorDate);
+    const { startOfWeekDate, startOfWeekIso, endOfWeekDate, endOfWeekIso } = computeStartOfWeek(anchorDate);
 
     const progress = (msg) => {
       statusEl.textContent = msg;
@@ -1340,30 +1683,44 @@
       progress("Resolving target assignee user...");
       const myUserId = await resolveUserIdFromAssigneeInput(assigneeKeyword);
 
-      progress("Running report 1/5...");
-      const report1 = await runAssignedCreatedThisWeek({ assigneeKeyword, startOfWeekDate, onProgress: progress });
+      progress("Running report 1/6...");
+      const report1 = await runAssignedCreatedThisWeek({ assigneeKeyword, startOfWeekDate, endOfWeekDate, onProgress: progress });
 
-      progress("Running report 2/5...");
-      const report2 = await runAssignedSolvedUpdatedThisWeek({ assigneeKeyword, startOfWeekDate, onProgress: progress });
+      progress("Running report 2/6...");
+      const report2 = await runAssignedSolvedUpdatedThisWeek({ assigneeKeyword, startOfWeekDate, endOfWeekDate, onProgress: progress });
 
-      progress("Running report 3/5...");
-      const reportOpen = await runOpenTicketsRemaining({ assigneeKeyword, onProgress: progress });
+      progress("Running report 3/6...");
+      const reportOpen = await runOpenTicketsRemaining({ assigneeKeyword, endOfWeekDate, onProgress: progress });
 
-      progress("Running report 4/5...");
-      const reportCarry = await runCarriedOverTickets({ assigneeKeyword, startOfWeekDate, onProgress: progress });
+      progress("Running report 4/6...");
+      const reportCarry = await runCarriedOverTickets({ assigneeKeyword, startOfWeekDate, endOfWeekDate, onProgress: progress });
 
-      progress("Running report 5/5 (audits)...");
+      progress("Running report 5/6 (audits)...");
       const report3 = await runTakeoverReport({
         assigneeKeyword,
         myUserId,
         startOfWeekDate,
+        endOfWeekDate,
         startOfWeekIso,
+        endOfWeekIso,
+        onProgress: progress
+      });
+
+      progress("Running report 6/6 (messages)...");
+      const startTimeEpoch = Math.floor(new Date(`${startOfWeekDate}T00:00:00Z`).getTime() / 1000);
+      const reportMessages = await runMessagesSentThisWeek({
+        assigneeKeyword,
+        authorId: myUserId,
+        startOfWeekDate,
+        endOfWeekDate,
+        startOfWeekIso,
+        endOfWeekIso,
         onProgress: progress
       });
 
       try {
         progress("Resolving organization/requester names...");
-        await enrichReportsWithNames([report1, report2, reportOpen, reportCarry, report3], progress);
+        await enrichReportasWithNames([report1, report2, reportOpen, reportCarry, report3, reportMessages], progress);
       } catch (nameError) {
         console.warn("Name resolution failed; continuing with IDs only.", nameError);
         progress("Name resolution partially failed; continuing with IDs.");
@@ -1376,13 +1733,18 @@
         week_starts_on: "Sunday",
         start_of_week_date: startOfWeekDate,
         start_of_week_iso: startOfWeekIso,
+        end_of_week_date: endOfWeekDate,
+        end_of_week_iso: endOfWeekIso,
         anchor_date: anchorDate.toISOString().slice(0, 10),
         takeover_batch_size: TAKEOVER_BATCH_SIZE,
         takeover_pause_seconds: Math.round(TAKEOVER_BATCH_SLEEP_MS / 1000),
+        message_start_time_epoch: startTimeEpoch,
         generated_at: new Date().toISOString()
       };
 
-      renderOutput({ meta, report1, report2, reportOpen, reportCarry, report3 });
+      renderOutput({ meta, report1, report2, reportOpen, reportCarry, report3, reportMessages });
+
+      console.table(buildMessageDebugTable(reportMessages.ticket_rows));
 
       latestRawOutput = [
         toTextBlock("Run Meta", meta),
@@ -1390,7 +1752,8 @@
         toTextBlock(report2.name, report2),
         toTextBlock(reportOpen.name, reportOpen),
         toTextBlock(reportCarry.name, reportCarry),
-        toTextBlock(report3.name, report3)
+        toTextBlock(report3.name, report3),
+        toTextBlock(reportMessages.name, reportMessages)
       ].join("\n");
 
       statusEl.textContent = "Done. UI shows summaries; Copy JSON for full raw payload.";
