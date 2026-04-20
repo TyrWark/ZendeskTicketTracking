@@ -1720,7 +1720,7 @@
 
       try {
         progress("Resolving organization/requester names...");
-        await enrichReportasWithNames([report1, report2, reportOpen, reportCarry, report3, reportMessages], progress);
+        await enrichReportsWithNames([report1, report2, reportOpen, reportCarry, report3, reportMessages], progress);
       } catch (nameError) {
         console.warn("Name resolution failed; continuing with IDs only.", nameError);
         progress("Name resolution partially failed; continuing with IDs.");
